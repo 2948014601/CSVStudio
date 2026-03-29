@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
+import codecs
 import csv
 import io
+import mmap
 import os
 import tempfile
 from collections import OrderedDict
@@ -46,6 +48,15 @@ class CsvMetadata:
     index: CsvIndex
 
 
+@dataclass(slots=True)
+class _ScanConfig:
+    unit_size: int
+    bom_length: int
+    quote_unit: bytes
+    lf_unit: bytes
+    cr_unit: bytes
+
+
 def detect_encoding(file_path: Path) -> str:
     for encoding in DEFAULT_ENCODINGS:
         try:
@@ -67,20 +78,104 @@ def detect_delimiter(file_path: Path, encoding: str) -> str:
         return ","
 
 
-def first_data_offset(file_path: Path) -> int:
+def _scan_config(file_path: Path, encoding: str) -> _ScanConfig:
     with file_path.open("rb") as handle:
-        handle.readline()
-        return handle.tell()
+        prefix = handle.read(4)
+
+    normalized = encoding.lower().replace("_", "-")
+    if normalized.startswith("utf-16"):
+        if prefix.startswith(codecs.BOM_UTF16_BE):
+            return _ScanConfig(
+                unit_size=2,
+                bom_length=len(codecs.BOM_UTF16_BE),
+                quote_unit=b"\x00\x22",
+                lf_unit=b"\x00\x0A",
+                cr_unit=b"\x00\x0D",
+            )
+        return _ScanConfig(
+            unit_size=2,
+            bom_length=len(codecs.BOM_UTF16_LE) if prefix.startswith(codecs.BOM_UTF16_LE) else 0,
+            quote_unit=b"\x22\x00",
+            lf_unit=b"\x0A\x00",
+            cr_unit=b"\x0D\x00",
+        )
+
+    return _ScanConfig(
+        unit_size=1,
+        bom_length=len(codecs.BOM_UTF8) if prefix.startswith(codecs.BOM_UTF8) else 0,
+        quote_unit=b'"',
+        lf_unit=b"\n",
+        cr_unit=b"\r",
+    )
+
+
+def _scan_first_data_offset(file_path: Path, encoding: str) -> int:
+    file_size = file_path.stat().st_size
+    if file_size == 0:
+        return 0
+
+    config = _scan_config(file_path, encoding)
+    with file_path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+        position = config.bom_length
+        in_quotes = False
+        record_has_content = False
+
+        while position + config.unit_size <= file_size:
+            unit = mapped[position : position + config.unit_size]
+
+            if unit == config.quote_unit:
+                record_has_content = True
+                next_position = position + config.unit_size
+                if in_quotes and next_position + config.unit_size <= file_size:
+                    next_unit = mapped[next_position : next_position + config.unit_size]
+                    if next_unit == config.quote_unit:
+                        position = next_position + config.unit_size
+                        continue
+                in_quotes = not in_quotes
+                position = next_position
+                continue
+
+            if not in_quotes and unit == config.cr_unit:
+                next_position = position + config.unit_size
+                if next_position + config.unit_size <= file_size:
+                    next_unit = mapped[next_position : next_position + config.unit_size]
+                    if next_unit == config.lf_unit:
+                        next_position += config.unit_size
+                if record_has_content:
+                    return next_position
+                position = next_position
+                continue
+
+            if not in_quotes and unit == config.lf_unit:
+                next_position = position + config.unit_size
+                if record_has_content:
+                    return next_position
+                position = next_position
+                continue
+
+            if unit not in {config.cr_unit, config.lf_unit}:
+                record_has_content = True
+            position += config.unit_size
+
+    return file_size
 
 
 def build_index(
     file_path: Path,
     chunk_size: int,
     progress_callback: ProgressCallback | None = None,
+    encoding: str | None = None,
 ) -> CsvIndex:
+    file_size = file_path.stat().st_size
+    if file_size == 0:
+        if progress_callback:
+            progress_callback(100, "空文件，索引完成")
+        return CsvIndex(row_count=0, chunk_size=chunk_size, chunk_offsets=[0])
+
+    resolved_encoding = encoding or detect_encoding(file_path)
+    config = _scan_config(file_path, resolved_encoding)
     chunk_offsets: list[int] = []
     row_count = 0
-    total_bytes = max(file_path.stat().st_size, 1)
     last_reported_percent = -1
 
     def report(progress_percent: int, message: str) -> None:
@@ -90,24 +185,72 @@ def build_index(
             last_reported_percent = progress_percent
             progress_callback(progress_percent, message)
 
-    with file_path.open("rb") as handle:
-        header = handle.readline()
-        if not header:
-            report(100, "空文件，索引完成")
-            return CsvIndex(row_count=0, chunk_size=chunk_size, chunk_offsets=[0])
+    header_found = False
+    in_quotes = False
+    record_has_content = False
 
-        chunk_offsets.append(handle.tell())
-        report(10, "已读取文件头，开始建立索引…")
-        while handle.readline():
+    def finalize_record(next_record_start: int) -> None:
+        nonlocal header_found, row_count, record_has_content
+        if not record_has_content:
+            return
+        if not header_found:
+            header_found = True
+            chunk_offsets.append(next_record_start)
+            report(10, "已定位 CSV 记录边界，开始建立索引…")
+        else:
             row_count += 1
             if row_count % chunk_size == 0:
-                chunk_offsets.append(handle.tell())
+                chunk_offsets.append(next_record_start)
             if row_count % 5000 == 0:
-                percent = int(handle.tell() / total_bytes * 88) + 10
-                report(percent, f"正在扫描行偏移索引，已处理约 {row_count:,} 行…")
+                percent = int(next_record_start / max(file_size, 1) * 88) + 10
+                report(percent, f"正在扫描 CSV 记录边界，已处理约 {row_count:,} 行…")
+        record_has_content = False
+
+    with file_path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+        position = config.bom_length
+        while position + config.unit_size <= file_size:
+            unit = mapped[position : position + config.unit_size]
+
+            if unit == config.quote_unit:
+                record_has_content = True
+                next_position = position + config.unit_size
+                if in_quotes and next_position + config.unit_size <= file_size:
+                    next_unit = mapped[next_position : next_position + config.unit_size]
+                    if next_unit == config.quote_unit:
+                        position = next_position + config.unit_size
+                        continue
+                in_quotes = not in_quotes
+                position = next_position
+                continue
+
+            if not in_quotes and unit == config.cr_unit:
+                next_position = position + config.unit_size
+                if next_position + config.unit_size <= file_size:
+                    next_unit = mapped[next_position : next_position + config.unit_size]
+                    if next_unit == config.lf_unit:
+                        next_position += config.unit_size
+                finalize_record(next_position)
+                position = next_position
+                continue
+
+            if not in_quotes and unit == config.lf_unit:
+                next_position = position + config.unit_size
+                finalize_record(next_position)
+                position = next_position
+                continue
+
+            if unit not in {config.cr_unit, config.lf_unit}:
+                record_has_content = True
+            position += config.unit_size
+
+        if record_has_content:
+            finalize_record(file_size)
+
+    if not header_found:
+        chunk_offsets = [config.bom_length]
 
     report(100, f"索引建立完成，共 {row_count:,} 行")
-    return CsvIndex(row_count=row_count, chunk_size=chunk_size, chunk_offsets=chunk_offsets or [0])
+    return CsvIndex(row_count=row_count, chunk_size=chunk_size, chunk_offsets=chunk_offsets or [config.bom_length])
 
 
 def classify_dtype(sample_series: pd.Series) -> str:
@@ -166,7 +309,7 @@ def inspect_csv_preview(file_path: str | Path, chunk_size: int = 2000, sample_ro
     preview_index = CsvIndex(
         row_count=int(len(preview_df.index)),
         chunk_size=chunk_size,
-        chunk_offsets=[first_data_offset(path)],
+        chunk_offsets=[_scan_first_data_offset(path, encoding)],
     )
 
     return CsvMetadata(
@@ -185,7 +328,7 @@ def inspect_csv_preview(file_path: str | Path, chunk_size: int = 2000, sample_ro
 
 def inspect_csv(file_path: str | Path, chunk_size: int = 2000, sample_rows: int = 1000) -> CsvMetadata:
     preview_metadata = inspect_csv_preview(file_path, chunk_size=chunk_size, sample_rows=sample_rows)
-    index = build_index(preview_metadata.file_path, chunk_size)
+    index = build_index(preview_metadata.file_path, chunk_size, encoding=preview_metadata.encoding)
     return replace(preview_metadata, index=index)
 
 
@@ -293,11 +436,13 @@ class ChunkedCsvSource:
             raw_handle.seek(byte_offset)
             text_handle = io.TextIOWrapper(raw_handle, encoding=self.metadata.encoding, newline="")
             reader = csv.reader(text_handle, delimiter=self.metadata.delimiter)
-            for _ in range(row_limit):
+            while len(rows) < row_limit:
                 try:
                     row = next(reader)
                 except StopIteration:
                     break
+                if row == []:
+                    continue
                 normalized = ["" if value is None else str(value) for value in row]
                 if len(normalized) < self.metadata.column_count:
                     normalized.extend([""] * (self.metadata.column_count - len(normalized)))

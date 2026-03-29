@@ -15,7 +15,7 @@
 
 ## 安装方式
 
-- windows 直接可运行的'exe' 安装包，下载zip解压后双击 `CSVStudio.exe` 即可使用 [点击下载exe安装包 (ZIP)](https://drive.google.com/file/d/1v402CVS1Ts3lyRIbbF59r7YFXOTxyUtz/view?usp=drive_link)
+- windows 直接可运行的'exe' 安装包，下载zip解压后双击 `CSVStudio.exe` 即可使用 [点击下载exe安装包 (ZIP)](https://drive.google.com/file/d/1oCJ4jHGKkYMd2nBBiPU7-tAZOizJob8N/view?usp=drive_link)
 - 其他平台或想直接运行源码的用户，请参考下面的 Python 环境安装说明
 
 ## Python 版本与依赖
